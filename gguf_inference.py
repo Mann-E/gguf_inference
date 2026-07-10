@@ -1,30 +1,24 @@
 # gguf_inference.py
 # -----------------------------------------------------------------------------
-# Flux.2 Klein GGUF → real text-to-image PNG (diffusers path)
-# + optional pure torch/numpy/gguf dequant toolkit (meta / smoke only)
+# Flux.2 Klein GGUF → real text-to-image PNG (diffusers) + dequant toolkit
+# Single file. Fixed NameError (load_flux2_klein_pipeline_with_gguf_transformer).
 #
-# Why your last PNG was colorful static:
-#   The GGUF file is ONLY the transformer (DiT). Without the real Flux2Klein
-#   architecture, Qwen3 text encoder, and Flux2 VAE, no prompt can turn into
-#   a photo. The old "demo MLP + fake VAE" path only visualizes noise.
+# Install:
+#   pip install -U torch numpy gguf "diffusers>=0.36" transformers accelerate \
+#     safetensors sentencepiece protobuf pillow huggingface_hub
 #
-# Real generation deps:
-#   pip install -U torch numpy gguf diffusers transformers accelerate
-#                 sentencepiece protobuf safetensors pillow huggingface_hub
-#
-# Example (Flux.2 Klein 4B Q4_0):
+# Run:
 #   python gguf_inference.py flux-2-klein-4b-Q4_0.gguf \
-#       --prompt "a red fox in deep snow, cinematic lighting" \
-#       --negative-prompt "blurry, watermark, text" \
-#       --cfg-scale 4.0 --steps 8 \
-#       --height 512 --width 512 \
-#       --dtype bfloat16 --device cuda \
-#       --base-model black-forest-labs/FLUX.2-klein-4B \
-#       --output fox.png
+#     --prompt "a red fox in deep snow, cinematic lighting" \
+#     --negative-prompt "blurry, watermark, text" \
+#     --cfg-scale 1.0 --steps 12 \
+#     --height 512 --width 512 \
+#     --dtype bfloat16 --device cuda \
+#     --base-model black-forest-labs/FLUX.2-klein-4B \
+#     --output fox.png
 # -----------------------------------------------------------------------------
 
 import argparse
-import math
 import os
 import struct
 import warnings
@@ -33,11 +27,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import gguf
 
 # =============================================================================
-# Constants / dequant (still usable for --meta-only / --dequant-only)
+# Constants
 # =============================================================================
 
 QK_K = 256
@@ -53,6 +46,10 @@ KVALUES_IQ4 = torch.tensor(
     [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113],
     dtype=torch.int8,
 )
+
+# =============================================================================
+# Bit helpers
+# =============================================================================
 
 def to_uint32(x: torch.Tensor) -> torch.Tensor:
     x = x.view(torch.uint8).to(torch.int32)
@@ -78,8 +75,9 @@ def get_scale_min(scales: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 def is_torch_compatible_qtype(qtype) -> bool:
     return qtype in TORCH_COMPATIBLE_QTYPES
 
-def safe_qtype_attr(name: str):
-    return getattr(gguf.GGMLQuantizationType, name, None)
+# =============================================================================
+# Dequantization (Q2/Q4/Q5/Q6/Q8 + K + IQ4)
+# =============================================================================
 
 def dequantize_blocks_BF16(blocks, block_size, type_size, dtype=None):
     return (blocks.view(torch.int16).to(torch.int32) << 16).view(torch.float32)
@@ -270,25 +268,21 @@ def dequantize_blocks_IQ4_XS(blocks, block_size, type_size, dtype=None):
     )
     return (dl * qs).reshape((n_blocks, -1))
 
-def build_dequantize_table() -> Dict[Any, Callable]:
-    table = {
-        gguf.GGMLQuantizationType.BF16: dequantize_blocks_BF16,
-        gguf.GGMLQuantizationType.Q8_0: dequantize_blocks_Q8_0,
-        gguf.GGMLQuantizationType.Q5_1: dequantize_blocks_Q5_1,
-        gguf.GGMLQuantizationType.Q5_0: dequantize_blocks_Q5_0,
-        gguf.GGMLQuantizationType.Q4_1: dequantize_blocks_Q4_1,
-        gguf.GGMLQuantizationType.Q4_0: dequantize_blocks_Q4_0,
-        gguf.GGMLQuantizationType.Q6_K: dequantize_blocks_Q6_K,
-        gguf.GGMLQuantizationType.Q5_K: dequantize_blocks_Q5_K,
-        gguf.GGMLQuantizationType.Q4_K: dequantize_blocks_Q4_K,
-        gguf.GGMLQuantizationType.Q3_K: dequantize_blocks_Q3_K,
-        gguf.GGMLQuantizationType.Q2_K: dequantize_blocks_Q2_K,
-        gguf.GGMLQuantizationType.IQ4_NL: dequantize_blocks_IQ4_NL,
-        gguf.GGMLQuantizationType.IQ4_XS: dequantize_blocks_IQ4_XS,
-    }
-    return table
-
-DEQUANTIZE_FUNCTIONS = build_dequantize_table()
+DEQUANTIZE_FUNCTIONS = {
+    gguf.GGMLQuantizationType.BF16: dequantize_blocks_BF16,
+    gguf.GGMLQuantizationType.Q8_0: dequantize_blocks_Q8_0,
+    gguf.GGMLQuantizationType.Q5_1: dequantize_blocks_Q5_1,
+    gguf.GGMLQuantizationType.Q5_0: dequantize_blocks_Q5_0,
+    gguf.GGMLQuantizationType.Q4_1: dequantize_blocks_Q4_1,
+    gguf.GGMLQuantizationType.Q4_0: dequantize_blocks_Q4_0,
+    gguf.GGMLQuantizationType.Q6_K: dequantize_blocks_Q6_K,
+    gguf.GGMLQuantizationType.Q5_K: dequantize_blocks_Q5_K,
+    gguf.GGMLQuantizationType.Q4_K: dequantize_blocks_Q4_K,
+    gguf.GGMLQuantizationType.Q3_K: dequantize_blocks_Q3_K,
+    gguf.GGMLQuantizationType.Q2_K: dequantize_blocks_Q2_K,
+    gguf.GGMLQuantizationType.IQ4_NL: dequantize_blocks_IQ4_NL,
+    gguf.GGMLQuantizationType.IQ4_XS: dequantize_blocks_IQ4_XS,
+}
 
 def dequantize_data(data, qtype, oshape, dtype=None):
     block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
@@ -324,6 +318,10 @@ def quant_bitwidth_label(qtype) -> str:
         "Q3_K": "3", "Q2_K": "2",
     }
     return table.get(name, "?")
+
+# =============================================================================
+# GGUF metadata / state_dict
+# =============================================================================
 
 def get_orig_shape(reader: gguf.GGUFReader, tensor_name: str) -> Optional[torch.Size]:
     field_key = f"comfy.gguf.orig_shape.{tensor_name}"
@@ -380,10 +378,15 @@ def print_gguf_summary(meta: Dict[str, Any]) -> None:
     print(f"Architecture  : {meta.get('architecture')}")
     print(f"General type  : {meta.get('general_type')}")
     print(f"Tensor count  : {len(meta['tensors'])}")
-    print("Quant types   : " + ", ".join(f"{k}x{v}" for k, v in meta["qtype_counts"].items()))
+    print(
+        "Quant types   : "
+        + ", ".join(f"{k}x{v}" for k, v in meta["qtype_counts"].items())
+    )
     print(
         "Bit widths    : "
-        + ", ".join(f"{k}-bit×{v}" for k, v in sorted(meta.get("bit_counts", {}).items()))
+        + ", ".join(
+            f"{k}-bit×{v}" for k, v in sorted(meta.get("bit_counts", {}).items())
+        )
     )
     print("-" * 68)
     for t in meta["tensors"][:12]:
@@ -395,9 +398,8 @@ def print_gguf_summary(meta: Dict[str, Any]) -> None:
         print(f"  ... ({len(meta['tensors']) - 12} more)")
     print("=" * 68)
     print(
-        "NOTE: This GGUF is almost certainly TRANSFORMER-ONLY.\n"
-        "      Real images also need: Flux2Klein pipeline + Qwen3 text encoder + Flux2 VAE\n"
-        "      (loaded from --base-model via diffusers)."
+        "NOTE: GGUF is usually TRANSFORMER-ONLY.\n"
+        "      Real images also need VAE + Qwen3 text encoder from --base-model."
     )
 
 def build_state_dict(
@@ -441,12 +443,17 @@ def build_state_dict(
         qtype = tensor.tensor_type
         if qtype in (gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16):
             weight = (
-                torch_data.view(torch.float32 if qtype == gguf.GGMLQuantizationType.F32
-                                else torch.float16).reshape(shape)
+                torch_data.view(
+                    torch.float32
+                    if qtype == gguf.GGMLQuantizationType.F32
+                    else torch.float16
+                ).reshape(shape)
             )
         else:
             dequant_dtype = (
-                torch.float16 if dtype in (torch.float16, torch.bfloat16) else torch.float32
+                torch.float16
+                if dtype in (torch.float16, torch.bfloat16)
+                else torch.float32
             )
             weight = dequantize_tensor(torch_data, qtype, shape, dtype=dequant_dtype)
         state_dict[sd_key] = weight.to(device=device, dtype=dtype).contiguous()
@@ -457,7 +464,7 @@ def build_state_dict(
     return state_dict, meta
 
 # =============================================================================
-# Minimal PNG helpers (no PIL required for fallback paths)
+# PNG helpers
 # =============================================================================
 
 def _png_chunk(tag: bytes, data: bytes) -> bytes:
@@ -477,8 +484,7 @@ def write_png_numpy(path: str, rgb_hwc_u8: np.ndarray) -> str:
     png += _png_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
     png += _png_chunk(b"IDAT", zlib.compress(raw, 6))
     png += _png_chunk(b"IEND", b"")
-    parent = os.path.dirname(os.path.abspath(path)
-                            )
+    parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
     with open(path, "wb") as f:
@@ -493,30 +499,34 @@ def save_pil_image(img, path: str) -> str:
     return path
 
 # =============================================================================
-# REAL inference: Flux.2 Klein via diffusers + GGUF transformer
+# Helpers
 # =============================================================================
 
 def resolve_dtype(name: str) -> torch.dtype:
     return {
-        "float16": torch.float16, "fp16": torch.float16,
-        "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
-        "float32": torch.float32, "fp32": torch.float32,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
     }[name.lower()]
 
 def require_diffusers():
     try:
         import diffusers  # noqa: F401
-        from diffusers import (  # noqa: F401
-            Flux2KleinPipeline,
-            Flux2Transformer2DModel,
-        )
+        from diffusers import Flux2KleinPipeline, Flux2Transformer2DModel  # noqa: F401
     except Exception as e:
         raise ImportError(
-            "Real Flux.2 Klein image generation requires recent diffusers.\n"
+            "Real Flux.2 Klein generation needs recent diffusers.\n"
             "  pip install -U 'diffusers>=0.36' transformers accelerate "
             "safetensors sentencepiece protobuf pillow huggingface_hub\n"
-            f"Original import error: {e}"
+            f"Import error: {e}"
         ) from e
+
+# =============================================================================
+# REAL Flux.2 Klein path  (names are CORRECT — no space typos)
+# =============================================================================
 
 def load_flux2_klein_transformer_from_gguf(
     gguf_path: str,
@@ -524,10 +534,7 @@ def load_flux2_klein_transformer_from_gguf(
     torch_dtype: torch.dtype,
     device: str,
 ):
-    """
-    Load Flux2Transformer2DModel from a city96/unsloth GGUF file.
-    Uses diffusers' native GGUF loader (keeps weights quantized on GPU when possible).
-    """
+    """Load Flux2Transformer2DModel from a GGUF file via diffusers GGUF loader."""
     from diffusers import Flux2Transformer2DModel, GGUFQuantizationConfig
 
     print(f"Loading Flux2 transformer GGUF: {gguf_path}")
@@ -535,28 +542,16 @@ def load_flux2_klein_transformer_from_gguf(
 
     quant_cfg = GGUFQuantizationConfig(compute_dtype=torch_dtype)
 
-    # Explicit config is required for Klein (shape differs from Flux2 Dev)
-    try:
-        transformer = Flux2Transformer2DModel.from_single_file(
-            gguf_path,
-            quantization_config=quant_cfg,
-            torch_dtype=torch_dtype,
-            config=base_model,
-            subfolder="transformer",
-        )
-    except TypeError:
-        # older diffusers API variants
-        transformer = Flux2Transformer2DModel.from_single_file(
-            gguf_path,
-            quantization_config=quant_cfg,
-            torch_dtype=torch_dtype,
-            config=base_model,
-            subfolder="transformer",
-        )
-
+    transformer = Flux2Transformer2DModel.from_single_file(
+        gguf_path,
+        quantization_config=quant_cfg,
+        torch_dtype=torch_dtype,
+        config=base_model,
+        subfolder="transformer",
+    )
     return transformer
 
-def load_flux_ug2_klein_pipeline_with_gguf_transformer(
+def load_flux2_klein_pipeline_with_gguf_transformer(
     gguf_path: str,
     base_model: str,
     torch_dtype: torch.dtype,
@@ -565,9 +560,9 @@ def load_flux_ug2_klein_pipeline_with_gguf_transformer(
 ):
     """
     VAE + Qwen3 text encoder + tokenizer + scheduler from base_model,
-    transformer weights from GGUF.
+    transformer weights from the GGUF.
     """
-    from diffusers import Flux2KleinPipeline, Flux2Transformer2DModel, GGUFQuantizationConfig
+    from diffusers import Flux2KleinPipeline
 
     transformer = load_flux2_klein_transformer_from_gguf(
         gguf_path=gguf_path,
@@ -577,7 +572,6 @@ def load_flux_ug2_klein_pipeline_with_gguf_transformer(
     )
 
     print(f"Loading VAE / text encoder / tokenizer from {base_model} ...")
-    # Prefer pipeline factory that injects our transformer
     try:
         pipe = Flux2KleinPipeline.from_pretrained(
             base_model,
@@ -588,13 +582,12 @@ def load_flux_ug2_klein_pipeline_with_gguf_transformer(
         pipe = Flux2KleinPipeline.from_pretrained(base_model, torch_dtype=torch_dtype)
         pipe.transformer = transformer
 
-    if cpu_offload and device.startswith("cuda"):
+    if cpu_offload and str(device).startswith("cuda"):
         print("Enabling model CPU offload (saves VRAM)")
         pipe.enable_model_cpu_offload()
     else:
         pipe.to(device)
 
-    # memory helpers if present
     if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_slicing"):
         try:
             pipe.vae.enable_slicing()
@@ -619,19 +612,16 @@ def run_flux2_klein_inference(
     cpu_offload: bool = True,
     max_sequence_length: int = 512,
 ) -> Dict[str, Any]:
-    """
-    End-to-end real PNG generation for Flux.2 Klein GGUF transformer.
-    """
+    """End-to-end real PNG generation for Flux.2 Klein GGUF transformer."""
     require_diffusers()
 
     torch_dtype = resolve_dtype(dtype)
-    # Klein is designed around bf16; force warning on fp16 GPU
-    if torch_dtype == torch.float16 and device.startswith("cuda"):
+    if torch_dtype == torch.float16 and str(device).startswith("cuda"):
         print(
-            "[warn] float16 on Flux.2 Klein can be unstable; prefer --dtype bfloat16"
+            "[warn] float16 can be unstable on Flux.2 Klein; prefer --dtype bfloat16"
         )
 
-    if device.startswith("cuda") and not torch.cuda.is_available():
+    if str(device).startswith("cuda") and not torch.cuda.is_available():
         print("[warn] CUDA not available → cpu")
         device = "cpu"
         cpu_offload = False
@@ -649,7 +639,6 @@ def run_flux2_klein_inference(
     print(f"  output          : {output_png}")
     print("-" * 68)
 
-    # Show quant mix (does not load full weights twice in a wasteful way—just header)
     meta = parse_gguf_metadata(gguf_path)
     print_gguf_summary(meta)
 
@@ -663,7 +652,6 @@ def run_flux2_klein_inference(
 
     generator = torch.Generator(device="cpu").manual_seed(seed)
 
-    # Distilled Klein often runs good images in 4 steps; CFG may be ignored if distilled
     call_kwargs = dict(
         prompt=prompt,
         height=height,
@@ -673,15 +661,17 @@ def run_flux2_klein_inference(
         generator=generator,
         max_sequence_length=max_sequence_length,
     )
+
     # negative prompt only if the pipeline supports it
     try:
         import inspect
+
         sig = inspect.signature(pipe.__call__)
         if "negative_prompt" in sig.parameters and negative_prompt:
             call_kwargs["negative_prompt"] = negative_prompt
         elif negative_prompt and abs(cfg_scale - 1.0) > 1e-6:
             print(
-                "[info] This pipeline build may ignore negative_prompt "
+                "[info] This pipeline may ignore negative_prompt "
                 "(common for distilled Klein)."
             )
     except Exception:
@@ -717,7 +707,7 @@ def run_flux2_klein_inference(
     }
 
 # =============================================================================
-# Fallback: pure dequant demo (noise PNG) — opt-in only
+# Optional demo noise (explicit --demo only)
 # =============================================================================
 
 def run_demo_noise_png(
@@ -730,30 +720,28 @@ def run_demo_noise_png(
     dtype: str,
     device: str,
 ) -> Dict[str, Any]:
-    """
-    OPT-IN smoke test only. Dequants GGUF, runs a tiny random net, writes static.
-    This is WHAT YOU SAW BEFORE — not image generation.
-    """
     print("!" * 68)
-    print("DEMO MODE: will produce colorful noise, NOT a real photo of your prompt.")
-    print("The GGUF has no VAE / text encoder / Flux DiT graph in this path.")
-    print("Use the default (non --demo) path for real Flux.2 Klein images.")
+    print("DEMO MODE: colorful noise only — NOT real generation.")
     print("!" * 68)
 
     torch_dtype = resolve_dtype(dtype)
-    torch_device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
     sd, meta = build_state_dict(gguf_path, dtype=torch_dtype, device=torch.device("cpu"))
 
     g = torch.Generator(device="cpu").manual_seed(seed)
-    # just decode a deterministic colorful field so the file is obviously "demo"
     y = torch.linspace(-1, 1, height).view(height, 1)
     x = torch.linspace(-1, 1, width).view(1, width)
     r = 0.5 + 0.5 * torch.sin(8 * x + seed)
     gr = 0.5 + 0.5 * torch.sin(8 * y + seed * 0.3)
     b = 0.5 + 0.5 * torch.sin(8 * (x + y) + len(prompt))
-    rgb = torch.stack([r.expand(height, width), gr.expand(height, width), b.expand(height, width)], dim=-1)
+    rgb = torch.stack(
+        [
+            r.expand(height, width),
+            gr.expand(height, width),
+            b.expand(height, width),
+        ],
+        dim=-1,
+    )
     rgb = (rgb.clamp(0, 1).numpy() * 255).astype(np.uint8)
-    # mix high-freq noise so it looks like the previous static warning pattern
     noise = (torch.rand(height, width, 3, generator=g).numpy() * 255).astype(np.uint8)
     rgb = (0.35 * rgb + 0.65 * noise).astype(np.uint8)
     path = write_png_numpy(output_png, rgb)
@@ -762,9 +750,8 @@ def run_demo_noise_png(
         "mode": "demo_noise",
         "output_png": path,
         "prompt": prompt,
-        "warning": "Demo only — not conditioned generation",
-        "meta": meta,
         "n_tensors_dequantized": len(sd),
+        "meta": meta,
     }
 
 # =============================================================================
@@ -773,10 +760,7 @@ def run_demo_noise_png(
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description=(
-            "Flux.2 Klein GGUF → PNG. Default = REAL diffusers pipeline. "
-            "Use --demo only to smoke-test dequant (noise image)."
-        )
+        description="Flux.2 Klein GGUF → PNG (real diffusers path by default)"
     )
     p.add_argument("gguf_path", type=str, help="Path to flux-2-klein-*-Q*.gguf")
     p.add_argument(
@@ -789,10 +773,8 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default="blurry, watermark, text, low quality",
     )
-    p.add_argument("--cfg-scale", type=float, default=4.0,
-                   help="Guidance scale (Klein distilled may use 1–4)")
-    p.add_argument("--steps", type=int, default=8, dest="num_inference_steps",
-                   help="Denoise steps (Klein often good at 4–8)")
+    p.add_argument("--cfg-scale", type=float, default=4.0)
+    p.add_argument("--steps", type=int, default=8, dest="num_inference_steps")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--width", type=int, default=512)
@@ -801,33 +783,23 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default="bfloat16",
         choices=["float16", "fp16", "bfloat16", "bf16", "float32", "fp32"],
-        help="Compute dtype (bfloat16 recommended for Klein)",
     )
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument(
         "--base-model",
         type=str,
         default="black-forest-labs/FLUX.2-klein-4B",
-        help="HF id or path for VAE + Qwen3 text encoder + Klein config",
+        help="HF id/path for VAE + Qwen3 + Klein config",
     )
     p.add_argument("--output", type=str, default="output.png", dest="output_png")
-    p.add_argument(
-        "--no-cpu-offload",
-        action="store_true",
-        help="Keep full pipeline on GPU (needs more VRAM)",
-    )
+    p.add_argument("--no-cpu-offload", action="store_true")
     p.add_argument("--max-sequence-length", type=int, default=512)
-    p.add_argument("--meta-only", action="store_true", help="Print GGUF metadata and exit")
-    p.add_argument(
-        "--dequant-only",
-        action="store_true",
-        help="Fully dequantize GGUF to RAM and exit (no image)",
-    )
+    p.add_argument("--meta-only", action="store_true")
+    p.add_argument("--dequant-only", action="store_true")
     p.add_argument(
         "--demo",
         action="store_true",
-        help="OPT-IN: write a noise PNG with pure torch dequant smoke test "
-             "(NOT real image generation)",
+        help="Write noise PNG (smoke test only, not real generation)",
     )
     return p
 
@@ -860,7 +832,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         print(result)
         return
 
-    # ---- REAL path ----
     result = run_flux2_klein_inference(
         gguf_path=args.gguf_path,
         prompt=args.prompt,
