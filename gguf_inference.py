@@ -556,7 +556,7 @@ def load_flux2_klein_transformer_from_gguf(
 
     return transformer
 
-def load_flux ug2_klein_pipeline_with_gguf_transformer(
+def load_flux_ug2_klein_pipeline_with_gguf_transformer(
     gguf_path: str,
     base_model: str,
     torch_dtype: torch.dtype,
