@@ -559,7 +559,7 @@ def print_gguf_summary(meta: Dict[str, Any]) -> None:
     print(f"Architecture  : {meta.get('architecture')}")
     print(f"General type  : {meta.get('general_type')}")
     print(f"Tensor count  : {len(meta['tensors'])}")
-   print(
+    print(
         "Quant types   : "
         + ", ".join(f"{k}x{v}" for k, v in meta["qtype_counts"].items())
     )
