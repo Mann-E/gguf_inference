@@ -1,10 +1,15 @@
 # gguf_inference.py
 # -----------------------------------------------------------------------------
-# Standalone GGUF → dequant → CFG / flow sampling → PNG
-# Target: Flux / SD3.5-style DiT weights in GGUF (Q2/Q4/Q8/K/IQ/TQ)
-# Dependencies: torch, numpy, gguf   (+ Python stdlib: zlib, struct, hashlib, ...)
+# Standalone GGUF → dequant → CFG / flow-match sampling → PNG
+# Target: Flux / SD3.5-style DiT weights in GGUF
+# Deps: torch, numpy, gguf  (+ stdlib: zlib, struct, hashlib, argparse, ...)
 # Style: functional (imports + def only). No ComfyUI.
-# Dequant math adapted from city96/ComfyUI-GGUF (Apache-2.0) + ggml TQ packing.
+# Dequant math adapted from city96/ComfyUI-GGUF (Apache-2.0).
+#
+# Fixes:
+#   * mat1 Float / mat2 Half → all demo-net activations forced to weight dtype
+#   * CPU + float16 → demo denoiser auto-promotes to float32
+#   * Time embed computed in fp32 then cast before Linear
 # -----------------------------------------------------------------------------
 
 import argparse
@@ -28,10 +33,9 @@ import gguf
 QK_K = 256
 K_SCALE_SIZE = 12
 
-# Flux AutoencoderKL defaults (diffusers FLUX.1)
 FLUX_VAE_SCALING_FACTOR = 0.3611
 FLUX_VAE_SHIFT_FACTOR = 0.1159
-FLUX_VAE_SCALE_SPATIAL = 8          # 8x spatial compression
+FLUX_VAE_SCALE_SPATIAL = 8
 FLUX_LATENT_CHANNELS = 16
 
 TORCH_COMPATIBLE_QTYPES = (
@@ -74,20 +78,16 @@ def is_torch_compatible_qtype(qtype) -> bool:
     return qtype in TORCH_COMPATIBLE_QTYPES
 
 def safe_qtype_attr(name: str):
-    """Return gguf.GGMLQuantizationType.<name> if present, else None."""
     return getattr(gguf.GGMLQuantizationType, name, None)
 
 # =============================================================================
-# Dequantization — full precision / legacy / K / IQ / TQ
-# Covered bit-widths: ~1.58 (TQ1), 2 (Q2_K, TQ2), 3 (Q3_K),
-#                     4 (Q4_*, IQ4_*), 5 (Q5_*), 6 (Q6_K), 8 (Q8_0)
+# Dequantization — 2 / 4 / 5 / 6 / 8 bit + K / IQ / optional TQ (~1.58)
 # =============================================================================
 
 def dequantize_blocks_BF16(blocks, block_size, type_size, dtype=None):
     return (blocks.view(torch.int16).to(torch.int32) << 16).view(torch.float32)
 
 def dequantize_blocks_Q8_0(blocks, block_size, type_size, dtype=None):
-    """8-bit: scale * int8"""
     d, x = split_block_dims(blocks, 2)
     d = d.view(torch.float16).to(dtype)
     x = x.view(torch.int8)
@@ -125,7 +125,6 @@ def dequantize_blocks_Q5_0(blocks, block_size, type_size, dtype=None):
     return d * qs
 
 def dequantize_blocks_Q4_1(blocks, block_size, type_size, dtype=None):
-    """4-bit with min"""
     n_blocks = blocks.shape[0]
     d, m, qs = split_block_dims(blocks, 2, 2)
     d = d.view(torch.float16).to(dtype)
@@ -137,7 +136,6 @@ def dequantize_blocks_Q4_1(blocks, block_size, type_size, dtype=None):
     return (d * qs) + m
 
 def dequantize_blocks_Q4_0(blocks, block_size, type_size, dtype=None):
-    """4-bit classic"""
     n_blocks = blocks.shape[0]
     d, qs = split_block_dims(blocks, 2)
     d = d.view(torch.float16).to(dtype)
@@ -187,7 +185,6 @@ def dequantize_blocks_Q5_K(blocks, block_size, type_size, dtype=None):
     return (d * q - dm).reshape((n_blocks, QK_K))
 
 def dequantize_blocks_Q4_K(blocks, block_size, type_size, dtype=None):
-    """4-bit K-quant (super-blocks) — most common Flux GGUF type"""
     n_blocks = blocks.shape[0]
     d, dmin, scales, qs = split_block_dims(blocks, 2, 2, K_SCALE_SIZE)
     d = d.view(torch.float16).to(dtype)
@@ -229,7 +226,6 @@ def dequantize_blocks_Q3_K(blocks, block_size, type_size, dtype=None):
     return (dl * q).reshape((n_blocks, QK_K))
 
 def dequantize_blocks_Q2_K(blocks, block_size, type_size, dtype=None):
-    """2-bit K-quant"""
     n_blocks = blocks.shape[0]
     scales, qs, d, dmin = split_block_dims(blocks, QK_K // 16, QK_K // 4, 2)
     d = d.view(torch.float16).to(dtype)
@@ -265,7 +261,8 @@ def dequantize_blocks_IQ4_XS(blocks, block_size, type_size, dtype=None):
     shift_b = torch.tensor(
         [2 * i for i in range(QK_K // 32)], device=d.device, dtype=torch.uint8
     ).reshape((1, -1, 1))
-    scales_l = scales_l.reshape((n_blocks, -1, 1)) >> shift_a.reshape((1, 1, 2))
+    scales_l = scales_l.reshape((n_blocks, -1, 1)) >> shift_a.reshape((1, 1, 2)
+    )
     scales_h = scales_h.reshape((n_blocks, -1, 1)) >> shift_b.reshape((1, -1, 1))
     scales_l = scales_l.reshape((n_blocks, -1)) & 0x0F
     scales_h = scales_h.reshape((n_blocks, -1)).to(torch.uint8) & 0x03
@@ -280,69 +277,31 @@ def dequantize_blocks_IQ4_XS(blocks, block_size, type_size, dtype=None):
     return (dl * qs).reshape((n_blocks, -1))
 
 def dequantize_blocks_TQ2_0(blocks, block_size, type_size, dtype=None):
-    """
-    ~2.06 bpw ternary (BitNet / TriLM style).
-    Packing (llama.cpp): 256 values/block, 4 trits/byte in 64 bytes + f16 scale.
-    Stored codes {0,1,2} map to {-1, 0, +1}.
-    Layout (zipped):
-      bytes 0..32  -> elements [0..32],[32..64],[64..96],[96..128]  via shifts 0,2,4,6
-      bytes 32..64 -> elements [128..160],...
-    Actually per PR table (MSB first of each pair order):
-      byte b: (x<<6)=idx+96 range etc — we expand via successive %3 style for TQ1;
-      for TQ2 each 2-bit nibble is independent.
-    """
+    """~2-bit ternary. Codes {0,1,2} → {-1,0,+1}."""
     n_blocks = blocks.shape[0]
-    # type_size is typically 66 = 64 packed + 2 scale
     qs, d = split_block_dims(blocks, 64)
     d = d.view(torch.float16).to(dtype)
-
     qs = qs.view(torch.uint8).reshape(n_blocks, 64)
-    # 4 values per byte → 256 trits
     shifts = torch.tensor([0, 2, 4, 6], device=qs.device, dtype=torch.uint8)
-    # PR layout reorders lanes; mathematically equivalent once dequant uses (code-1)*d
-    # Expand: for each byte extract 4x 2-bit fields
-    qs4 = qs.unsqueeze(-1) >> shifts.view(1, 1, 4)
-    qs4 = (qs4 & 0x03).to(torch.int8)  # (n_blocks, 64, 4)
-    # Reorder to match TQ2_0 interleaving (optional but closer to reference):
-    # lanes correspond ~ to different 32-element bands
-    # qs4[...,0] → low band, ..., qs4[...,3] → high — transpose groups
-    q = qs4.permute(0, 2, 1).reshape(n_blocks, 4, 64)
-    # Map bands into 0..255 contiguous-ish order used by ggml:
-    # band0: indices 0..63 stored across bytes with shift0 etc — keep simple linear
-    q = qs4.reshape(n_blocks, 256)
-    q = q.to(dtype) - 1.0  # {0,1,2} → {-1,0,1}
+    qs4 = (qs.unsqueeze(-1) >> shifts.view(1, 1, 4)) & 0x03
+    q = qs4.reshape(n_blocks, 256).to(dtype) - 1.0
     return (d.reshape(n_blocks, 1) * q).reshape(n_blocks, QK_K)
 
 def dequantize_blocks_TQ1_0(blocks, block_size, type_size, dtype=None):
-    """
-    ~1.69 bpw ternary packing (3^5 < 256). Optional — torch path.
-    Falls back-friendly: packs 5 trits/byte for first 240 elems, 4 for last 16,
-    then f16 scale. Codes {0,1,2} → {-1,0,1}.
-    """
+    """~1.58-bit ternary packing (optional)."""
     n_blocks = blocks.shape[0]
-    # type_size typically 54 = 52 packed + 2 scale
     qs, d = split_block_dims(blocks, 52)
     d = d.view(torch.float16).to(dtype)
     qs = qs.view(torch.uint8).reshape(n_blocks, 52).to(torch.int32)
-
-    # Fixed-point base-3 peel (most-significant trit first): repeated %3 after * something
-    # From llama.cpp: stores such that successive `x % 3` peels trits.
     out = torch.empty((n_blocks, 256), device=blocks.device, dtype=torch.int32)
 
-    # Bytes 0..47 encode 5 trits each (240 values). Process longhand in groups.
-    # For each base-3 packed byte b: successive
-    #   t0 = b % 3; b //= 3; ...  (if stored least-first)
-    # PR says fixed-point extracts most-significant digit first with multiplications.
-    # We use iterative div/mod which matches ggml-py dequant.
     def peel5(byte_vals: torch.Tensor) -> torch.Tensor:
-        # byte_vals: (n_blocks, n_bytes)
         trits = []
         x = byte_vals
         for _ in range(5):
             trits.append(x % 3)
             x = x // 3
-        # MS trit first → reverse
-        return torch.stack(list(reversed(trits)), dim=-1)  # (..., 5)
+        return torch.stack(list(reversed(trits)), dim=-1)
 
     def peel4(byte_vals: torch.Tensor) -> torch.Tensor:
         trits = []
@@ -352,30 +311,21 @@ def dequantize_blocks_TQ1_0(blocks, block_size, type_size, dtype=None):
             x = x // 3
         return torch.stack(list(reversed(trits)), dim=-1)
 
-    # Per PR table bands are interleaved across bytes — reconstruct 256 in order 0..255
-    # Simpler correct approach used by reference: sequential fill following spec bands.
-    # Band mapping from PR:
-    # bytes 0..32: 5 trits → positions 0..32, 32..64, 64..96, 96..128, 128..160
-    b0 = qs[:, 0:32]
-    t0 = peel5(b0)  # (n, 32, 5)
+    t0 = peel5(qs[:, 0:32])
     out[:, 0:32] = t0[:, :, 0]
     out[:, 32:64] = t0[:, :, 1]
     out[:, 64:96] = t0[:, :, 2]
     out[:, 96:128] = t0[:, :, 3]
     out[:, 128:160] = t0[:, :, 4]
 
-    # bytes 32..48 → 160..240
-    b1 = qs[:, 32:48]
-    t1 = peel5(b1)  # (n, 16, 5)
+    t1 = peel5(qs[:, 32:48])
     out[:, 160:176] = t1[:, :, 0]
     out[:, 176:192] = t1[:, :, 1]
     out[:, 192:208] = t1[:, :, 2]
     out[:, 208:224] = t1[:, :, 3]
     out[:, 224:240] = t1[:, :, 4]
 
-    # bytes 48..52 → 240..256 (4 trits)
-    b2 = qs[:, 48:52]
-    t2 = peel4(b2)  # (n, 4, 4)
+    t2 = peel4(qs[:, 48:52])
     out[:, 240:244] = t2[:, :, 0]
     out[:, 244:248] = t2[:, :, 1]
     out[:, 248:252] = t2[:, :, 2]
@@ -400,19 +350,12 @@ def build_dequantize_table() -> Dict[Any, Callable]:
         gguf.GGMLQuantizationType.IQ4_NL: dequantize_blocks_IQ4_NL,
         gguf.GGMLQuantizationType.IQ4_XS: dequantize_blocks_IQ4_XS,
     }
-    # Optional enums depending on gguf-py version
     tq2 = safe_qtype_attr("TQ2_0")
     tq1 = safe_qtype_attr("TQ1_0")
     if tq2 is not None:
         table[tq2] = dequantize_blocks_TQ2_0
     if tq1 is not None:
         table[tq1] = dequantize_blocks_TQ1_0
-    # Aliases some tooling uses
-    for alias in ("IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ1_M"):
-        qt = safe_qtype_attr(alias)
-        if qt is not None:
-            # torch path not hand-written → leave to numpy fallback
-            pass
     return table
 
 DEQUANTIZE_FUNCTIONS = build_dequantize_table()
@@ -437,7 +380,6 @@ def dequantize_tensor(
     oshape: torch.Size,
     dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """Dequantize one tensor. Torch path for 2/4/5/6/8-bit + TQ; else gguf numpy."""
     if is_torch_compatible_qtype(qtype):
         if qtype == gguf.GGMLQuantizationType.F32:
             t = data.view(torch.float32)
@@ -451,7 +393,6 @@ def dequantize_tensor(
     if qtype in DEQUANTIZE_FUNCTIONS:
         return dequantize_data(data, qtype, oshape, dtype=dtype)
 
-    # Numpy path (IQ1/IQ2/IQ3 grids, any new types gguf-py knows)
     name = getattr(qtype, "name", repr(qtype))
     print(f"[warn] numpy fallback dequant for qtype={name}")
     arr = gguf.quants.dequantize(data.cpu().numpy(), qtype)
@@ -461,35 +402,22 @@ def dequantize_tensor(
 def quant_bitwidth_label(qtype) -> str:
     name = getattr(qtype, "name", str(qtype))
     table = {
-        "F32": "32",
-        "F16": "16",
-        "BF16": "16",
+        "F32": "32", "F16": "16", "BF16": "16",
         "Q8_0": "8",
         "Q6_K": "6",
-        "Q5_0": "5",
-        "Q5_1": "5",
-        "Q5_K": "5",
-        "Q4_0": "4",
-        "Q4_1": "4",
-        "Q4_K": "4",
-        "IQ4_NL": "4",
-        "IQ4_XS": "4",
+        "Q5_0": "5", "Q5_1": "5", "Q5_K": "5",
+        "Q4_0": "4", "Q4_1": "4", "Q4_K": "4", "IQ4_NL": "4", "IQ4_XS": "4",
         "Q3_K": "3",
-        "Q2_K": "2",
-        "TQ2_0": "2",
+        "Q2_K": "2", "TQ2_0": "2",
         "TQ1_0": "1.58",
-        "IQ2_XXS": "2",
-        "IQ2_XS": "2",
-        "IQ2_S": "2",
-        "IQ3_XXS": "3",
-        "IQ3_S": "3",
-        "IQ1_S": "1.5",
-        "IQ1_M": "1.5",
+        "IQ2_XXS": "2", "IQ2_XS": "2", "IQ2_S": "2",
+        "IQ3_XXS": "3", "IQ3_S": "3",
+        "IQ1_S": "1.5", "IQ1_M": "1.5",
     }
     return table.get(name, "?")
 
 # =============================================================================
-# GGUF metadata + state dict
+# GGUF metadata + state_dict
 # =============================================================================
 
 def get_orig_shape(reader: gguf.GGUFReader, tensor_name: str) -> Optional[torch.Size]:
@@ -565,7 +493,9 @@ def print_gguf_summary(meta: Dict[str, Any]) -> None:
     )
     print(
         "Bit widths    : "
-        + ", ".join(f"{k}-bit×{v}" for k, v in sorted(meta.get("bit_counts", {}).items()))
+        + ", ".join(
+            f"{k}-bit×{v}" for k, v in sorted(meta.get("bit_counts", {}).items())
+        )
     )
     print("-" * 68)
     for t in meta["tensors"][:12]:
@@ -666,7 +596,7 @@ def patch_model(
     return model
 
 # =============================================================================
-# Prompt embeds (stdlib-only char embedder; optional external text_encoder)
+# Prompt embeds
 # =============================================================================
 
 def _stable_seed_from_text(text: str) -> int:
@@ -691,7 +621,8 @@ def build_text_embedding_table(
         g = torch.Generator(device="cpu")
         g.manual_seed(seed)
         emb.weight.copy_(
-            torch.randn(vocab_size, embed_dim, generator=g).to(device=device, dtype=dtype)
+            torch.randn(vocab_size, embed_dim, generator=g)
+            .to(device=device, dtype=dtype)
             * 0.02
         )
     emb.eval()
@@ -705,10 +636,11 @@ def encode_prompt_text(
     device = embed_table.weight.device
     ids = tokenize_chars(prompt, max_length=max_length).to(device)
     with torch.no_grad():
-        seq = embed_table(ids).unsqueeze(0)  # [1, L, D]
+        seq = embed_table(ids).unsqueeze(0)
         mask = (ids != 0).float().unsqueeze(0).unsqueeze(-1)
         denom = mask.sum(dim=1).clamp(min=1.0)
-        return (seq * mask).sum(dim=1) / denom  # [1, D]
+        pooled = (seq * mask.to(seq.dtype)).sum(dim=1) / denom.to(seq.dtype)
+        return pooled.to(dtype=embed_table.weight.dtype)
 
 def encode_prompts_cfg(
     prompt: str,
@@ -728,7 +660,7 @@ def encode_prompts_cfg(
     return cond, uncond
 
 # =============================================================================
-# Schedulers: Flow-Match (Flux) + classic Euler-discrete
+# Schedulers
 # =============================================================================
 
 def make_sigmas_flowmatch(
@@ -737,11 +669,6 @@ def make_sigmas_flowmatch(
     dtype: torch.dtype = torch.float32,
     shift: float = 1.0,
 ) -> torch.Tensor:
-    """
-    Flux-style flow-matching timesteps in (0, 1], shifted.
-    sigma goes high → low.
-    """
-    # Base linspace of timesteps in [1, 0)
     t = torch.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps, device=device)
     if abs(shift - 1.0) > 1e-6:
         t = (shift * t) / (1.0 + (shift - 1.0) * t)
@@ -753,12 +680,8 @@ def flowmatch_euler_step(
     sigma: float,
     sigma_next: float,
 ) -> torch.Tensor:
-    """
-    Euler ODE step for rectified-flow / Flux:
-        dx/dt = v_theta(x, t)   with  x_{t+dt} = x_t + dt * v
-    Here model_output is velocity v (common Flux convention).
-    """
-    dt = sigma_next - sigma
+    model_output = model_output.to(device=sample.device, dtype=sample.dtype)
+    dt = float(sigma_next) - float(sigma)
     return sample + model_output * dt
 
 def make_beta_schedule(
@@ -775,9 +698,7 @@ def make_beta_schedule(
         )
     raise ValueError(schedule)
 
-def make_scheduler_ddpm(
-    num_train_timesteps: int = 1000,
-) -> Dict[str, torch.Tensor]:
+def make_scheduler_ddpm(num_train_timesteps: int = 1000) -> Dict[str, torch.Tensor]:
     betas = make_beta_schedule(num_train_timesteps)
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0)
@@ -804,20 +725,20 @@ def euler_ddpm_step(
     prev_timestep: int,
     alphas_cumprod: torch.Tensor,
 ) -> torch.Tensor:
-    alpha_prod_t = alphas_cumprod[timestep]
+    model_output = model_output.to(device=sample.device, dtype=sample.dtype)
+    alpha_prod_t = alphas_cumprod[timestep].to(sample.dtype)
     alpha_prod_t_prev = (
-        alphas_cumprod[prev_timestep]
+        alphas_cumprod[prev_timestep].to(sample.dtype)
         if prev_timestep >= 0
-        else torch.tensor(1.0, device=alphas_cumprod.device, dtype=alphas_cumprod.dtype)
+        else torch.tensor(1.0, device=sample.device, dtype=sample.dtype)
     )
     beta_prod_t = 1.0 - alpha_prod_t
     pred_x0 = (sample - beta_prod_t.sqrt() * model_output) / alpha_prod_t.sqrt()
-    pred_eps = model_output
-    dir_xt = (1.0 - alpha_prod_t_prev).sqrt() * pred_eps
+    dir_xt = (1.0 - alpha_prod_t_prev).sqrt() * model_output
     return alpha_prod_t_prev.sqrt() * pred_x0 + dir_xt
 
 # =============================================================================
-# CFG + sampling loops
+# CFG + sampling loops (dtype-locked)
 # =============================================================================
 
 def apply_cfg(
@@ -827,6 +748,7 @@ def apply_cfg(
 ) -> torch.Tensor:
     if pred_uncond is None or abs(cfg_scale - 1.0) < 1e-6:
         return pred_cond
+    pred_uncond = pred_uncond.to(device=pred_cond.device, dtype=pred_cond.dtype)
     return pred_uncond + cfg_scale * (pred_cond - pred_uncond)
 
 def denoising_loop_flowmatch(
@@ -844,7 +766,10 @@ def denoising_loop_flowmatch(
         and abs(cfg_scale - 1.0) >= 1e-6
     )
     x = latents
-    # append terminal sigma 0 for final step
+    cond_embeds = cond_embeds.to(device=x.device, dtype=x.dtype)
+    if uncond_embeds is not None:
+        uncond_embeds = uncond_embeds.to(device=x.device, dtype=x.dtype)
+
     sigmas_ext = torch.cat(
         [sigmas, torch.zeros(1, device=sigmas.device, dtype=sigmas.dtype)]
     )
@@ -852,7 +777,6 @@ def denoising_loop_flowmatch(
     for i in range(n):
         sigma = float(sigmas_ext[i].item())
         sigma_next = float(sigmas_ext[i + 1].item())
-        # discrete timestep id for modules that expect long t
         t_id = int(sigma * 1000)
         t_batch = torch.full((x.shape[0],), t_id, device=x.device, dtype=torch.long)
 
@@ -863,12 +787,13 @@ def denoising_loop_flowmatch(
         else:
             v = denoise_fn(x, t_batch, cond_embeds, sigma)
 
+        v = v.to(device=x.device, dtype=x.dtype)
         x = flowmatch_euler_step(x, v, sigma, sigma_next)
 
         if (i + 1) % max(1, n // 5) == 0 or i == n - 1:
             print(
                 f"  flow step {i + 1}/{n}  σ={sigma:.4f}→{sigma_next:.4f}  "
-                f"x_std={x.float().std().item():.5f}"
+                f"x_std={x.float().std().item():.5f}  x_dtype={x.dtype}"
             )
     return x
 
@@ -888,7 +813,11 @@ def denoising_loop_ddpm(
         and abs(cfg_scale - 1.0) >= 1e-6
     )
     x = latents
+    cond_embeds = cond_embeds.to(device=x.device, dtype=x.dtype)
+    if uncond_embeds is not None:
+        uncond_embeds = uncond_embeds.to(device=x.device, dtype=x.dtype)
     alphas_cumprod = alphas_cumprod.to(device=x.device, dtype=torch.float32)
+
     n = len(timesteps)
     for i, t in enumerate(timesteps):
         t_int = int(t.item())
@@ -900,33 +829,41 @@ def denoising_loop_ddpm(
         else:
             eps = denoise_fn(x, t_batch, cond_embeds, None)
 
+        eps = eps.to(device=x.device, dtype=x.dtype)
         t_prev = int(timesteps[i + 1].item()) if i + 1 < n else -1
         x = euler_ddpm_step(x, eps, t_int, t_prev, alphas_cumprod)
 
         if (i + 1) % max(1, n // 5) == 0 or i == n - 1:
             print(
                 f"  ddpm step {i + 1}/{n}  t={t_int}  "
-                f"x_std={x.float().std().item():.5f}"
+                f"x_std={x.float().std().item():.5f}  x_dtype={x.dtype}"
             )
     return x
 
 # =============================================================================
-# Demo Flux-ish denoiser (smoke / preview when no arch is supplied)
+# Demo denoiser (dtype-safe)
 # =============================================================================
 
 def _sinusoidal_timestep_embedding(
-    timesteps: torch.Tensor, dim: int, max_period: int = 10000
+    timesteps: torch.Tensor,
+    dim: int,
+    max_period: int = 10000,
+    dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
+    """Compute in float32, cast to target dtype before Linear use."""
     half = dim // 2
+    device = timesteps.device
     freqs = torch.exp(
         -math.log(max_period)
-        * torch.arange(0, half, dtype=torch.float32, device=timesteps.device)
+        * torch.arange(0, half, dtype=torch.float32, device=device)
         / half
     )
     args = timesteps.float().unsqueeze(1) * freqs.unsqueeze(0)
     emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
     if dim % 2:
         emb = F.pad(emb, (0, 1))
+    if dtype is not None:
+        emb = emb.to(dtype=dtype)
     return emb
 
 def build_demo_denoiser(
@@ -938,16 +875,32 @@ def build_demo_denoiser(
     hidden: int = 384,
     device: torch.device = torch.device("cpu"),
     dtype: torch.dtype = torch.float16,
-) -> Tuple[torch.nn.Module, Callable]:
+) -> Tuple[torch.nn.Module, Callable, torch.dtype]:
+    """
+    Tiny residual MLP over flattened latents.
+
+    Returns (module, denoise_fn, active_dtype).
+    On CPU + float16, active_dtype is promoted to float32 (stable matmul).
+    """
+    active_dtype = dtype
+    if device.type == "cpu" and dtype == torch.float16:
+        print("[info] CPU + float16 → demo denoiser uses float32 (stable matmul)")
+        active_dtype = torch.float32
+
     flat_dim = latent_channels * latent_h * latent_w
     time_dim = hidden
 
     in_proj = torch.nn.Linear(
-        flat_dim + context_dim + time_dim, hidden, device=device, dtype=dtype
+        flat_dim + context_dim + time_dim, hidden, device=device, dtype=active_dtype
     )
-    mid = torch.nn.Linear(hidden, hidden, device=device, dtype=dtype)
-    out_proj = torch.nn.Linear(hidden, flat_dim, device=device, dtype=dtype)
-    time_proj = torch.nn.Linear(time_dim, time_dim, device=device, dtype=dtype)
+    mid = torch.nn.Linear(hidden, hidden, device=device, dtype=active_dtype)
+    out_proj = torch.nn.Linear(hidden, flat_dim, device=device, dtype=active_dtype)
+    time_proj = torch.nn.Linear(time_dim, time_dim, device=device, dtype=active_dtype)
+
+    with torch.no_grad():
+        for layer in (in_proj, mid, out_proj, time_proj):
+            if layer.bias is not None:
+                layer.bias.zero_()
 
     if state_dict:
         candidates = [
@@ -958,14 +911,17 @@ def build_demo_denoiser(
             k, w = cand
             with torch.no_grad():
                 src = w.detach().float().cpu()
-                tgt = torch.zeros(layer.weight.shape)
+                tgt = torch.zeros(layer.weight.shape, dtype=torch.float32)
                 r = min(src.shape[0], tgt.shape[0])
                 c = min(src.shape[1], tgt.shape[1])
                 tgt[:r, :c] = src[:r, :c]
                 std = tgt.std().clamp(min=1e-3)
                 tgt = tgt / std * 0.02
-                layer.weight.copy_(tgt.to(device=device, dtype=dtype))
-            print(f"  demo warm-start {k} → {tuple(layer.weight.shape)}")
+                layer.weight.copy_(tgt.to(device=device, dtype=active_dtype))
+            print(
+                f"  demo warm-start {k} → {tuple(layer.weight.shape)} "
+                f"dtype={active_dtype}"
+            )
 
     net = torch.nn.Module()
     net.in_proj = in_proj
@@ -974,32 +930,56 @@ def build_demo_denoiser(
     net.time_proj = time_proj
     net.eval()
 
+    param_dtype = active_dtype
+    param_device = device
+
     def denoise_fn(x, t_batch, text_embeds, sigma=None):
+        # Force every tensor onto Linear weight dtype/device BEFORE any matmul
+        x = x.to(device=param_device, dtype=param_dtype)
+        t_batch = t_batch.to(device=param_device)
+        text_embeds = text_embeds.to(device=param_device, dtype=param_dtype)
+
         b, c, h, w = x.shape
         x_flat = x.reshape(b, -1)
-        t_emb = _sinusoidal_timestep_embedding(t_batch, time_dim).to(
-            device=x.device, dtype=x.dtype
-        )
+
+        t_emb = _sinusoidal_timestep_embedding(
+            t_batch, time_dim, dtype=param_dtype
+        ).to(device=param_device, dtype=param_dtype)
         t_emb = net.time_proj(t_emb)
+
         ctx = text_embeds
+        if ctx.ndim == 3:
+            ctx = ctx.mean(dim=1)
         if ctx.shape[0] == 1 and b > 1:
-            ctx = ctx.expand(b, -1)
+            ctx = ctx.expand(b, -1).contiguous()
         if ctx.shape[-1] < context_dim:
             ctx = F.pad(ctx, (0, context_dim - ctx.shape[-1]))
         elif ctx.shape[-1] > context_dim:
             ctx = ctx[..., :context_dim]
+        ctx = ctx.to(device=param_device, dtype=param_dtype)
+
         hcat = torch.cat([x_flat, ctx, t_emb], dim=-1)
+        hcat = hcat.to(device=param_device, dtype=param_dtype)
+
         hdn = F.silu(net.in_proj(hcat))
         hdn = F.silu(net.mid(hdn))
         out = net.out_proj(hdn).view(b, c, h, w)
-        return out
+        return out.to(dtype=param_dtype)
 
-    return net, denoise_fn
+    return net, denoise_fn, active_dtype
 
 def wrap_user_denoise_fn(model: torch.nn.Module, call_style: str = "flux") -> Callable:
     def denoise_fn(x, t_batch, text_embeds, sigma=None):
+        # Keep inputs on model parameter dtype
+        try:
+            p = next(model.parameters())
+            x = x.to(device=p.device, dtype=p.dtype)
+            text_embeds = text_embeds.to(device=p.device, dtype=p.dtype)
+            t_batch = t_batch.to(device=p.device)
+        except StopIteration:
+            pass
+
         if call_style == "flux":
-            # common: model(x, timestep, context) → tensor or .sample
             out = model(x, t_batch, text_embeds)
             return out.sample if hasattr(out, "sample") else out
         if call_style == "diffusers":
@@ -1013,7 +993,7 @@ def wrap_user_denoise_fn(model: torch.nn.Module, call_style: str = "flux") -> Ca
     return denoise_fn
 
 # =============================================================================
-# Latents helpers + Flux unpack
+# Latents + Flux pack/unpack
 # =============================================================================
 
 def make_noise_latents(
@@ -1038,17 +1018,12 @@ def unpack_flux_latents(
     width_px: int,
     vae_scale_factor: int = FLUX_VAE_SCALE_SPATIAL,
 ) -> torch.Tensor:
-    """
-    Diffusers Flux packing reverse:
-      packed [B, H/2 * W/2, C*4]  →  [B, C, H, W]
-    Also accepts already-unpacked [B, C, H, W].
-    """
     if latents.ndim == 4:
         return latents
     if latents.ndim != 3:
         raise ValueError(f"Expected 3D packed or 4D latent, got {latents.shape}")
 
-    batch_size, num_patches, channels_x4 = latents.shape
+    batch_size, _num_patches, channels_x4 = latents.shape
     h = 2 * (int(height_px) // (vae_scale_factor * 2))
     w = 2 * (int(width_px) // (vae_scale_factor * 2))
     c = channels_x4 // 4
@@ -1057,14 +1032,13 @@ def unpack_flux_latents(
     return latents.reshape(batch_size, c, h, w)
 
 def pack_flux_latents(latents: torch.Tensor) -> torch.Tensor:
-    """[B, C, H, W] → [B, H/2*W/2, C*4]"""
     b, c, h, w = latents.shape
     latents = latents.view(b, c, h // 2, 2, w // 2, 2)
     latents = latents.permute(0, 2, 4, 1, 3, 5)
     return latents.reshape(b, (h // 2) * (w // 2), c * 4)
 
 # =============================================================================
-# Latent → RGB  (real Flux needs VAE; we ship a strong approx + optional hook)
+# Latent → RGB → PNG
 # =============================================================================
 
 def approximate_vae_decode(
@@ -1075,23 +1049,13 @@ def approximate_vae_decode(
     shift_factor: float = FLUX_VAE_SHIFT_FACTOR,
 ) -> torch.Tensor:
     """
-    Approximate "VAE decode" without shipping AutoencoderKL weights.
-
-    Steps:
-      1. Undo Flux latent shift/scale
-      2. Project C (16 or 4) channels → 3 RGB via fixed orthonormal mix
-      3. Bilinear upsample to pixel resolution
-      4. Mild spatial sharpening + tanh squash to [-1, 1]
-
-    Good enough for pipeline smoke tests & quant validation PNGs.
-    Plug a real VAE via `vae_decode_fn` in run_inference for production images.
+    Approximate decode when no real AutoencoderKL is available.
+    Produces a valid visualization PNG for pipeline / quant smoke tests.
     """
     x = latents.float()
-    # Flux: image_latents = (latents / scaling) + shift   during decode prep
     x = (x / scaling_factor) + shift_factor
 
     b, c, h, w = x.shape
-    # Deterministic channel → RGB mix (seeded Hadamard-ish acids)
     g = torch.Generator(device="cpu")
     g.manual_seed(0xF10A5)
     mix = torch.randn(3, c, generator=g)
@@ -1099,30 +1063,22 @@ def approximate_vae_decode(
     mix = mix.to(device=x.device, dtype=x.dtype)
 
     rgb = torch.einsum("bchw,kc->bkhw", x, mix)
-
-    # Local contrast
     blur = F.avg_pool2d(rgb, kernel_size=3, stride=1, padding=1)
     rgb = rgb + 0.35 * (rgb - blur)
-
     rgb = F.interpolate(
         rgb, size=(height_px, width_px), mode="bilinear", align_corners=False
     )
-    # Map to [-1, 1]
-    rgb = torch.tanh(rgb * 0.75)
-    return rgb
+    return torch.tanh(rgb * 0.75)
 
 def tensor_to_uint8_image(img: torch.Tensor) -> np.ndarray:
-    """
-    img: [B, 3, H, W] or [3, H, W] in [-1, 1] or [0, 1] → uint8 HWC RGB
-    """
     if img.ndim == 4:
         img = img[0]
     x = img.detach().float().cpu()
-    if x.min() < -0.05:
+    if float(x.min()) < -0.05:
         x = (x + 1.0) * 0.5
     x = x.clamp(0.0, 1.0)
     x = (x * 255.0).round().to(torch.uint8)
-    return x.permute(1, 2, 0).numpy()  # HWC
+    return x.permute(1, 2, 0).numpy()
 
 def _png_chunk(tag: bytes, data: bytes) -> bytes:
     return (
@@ -1133,24 +1089,19 @@ def _png_chunk(tag: bytes, data: bytes) -> bytes:
     )
 
 def write_png(path: str, rgb_hwc_u8: np.ndarray) -> str:
-    """
-    Minimal truecolor PNG writer (no PIL).
-    rgb_hwc_u8: uint8 array HxWx3
-    """
     if rgb_hwc_u8.dtype != np.uint8 or rgb_hwc_u8.ndim != 3 or rgb_hwc_u8.shape[2] != 3:
         raise ValueError("write_png expects HxWx3 uint8 RGB")
     h, w, _ = rgb_hwc_u8.shape
-    # filter byte 0 per scanline
     raw = b"".join(b"\x00" + rgb_hwc_u8[y].tobytes() for y in range(h))
     compressed = zlib.compress(raw, level=6)
-
-    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)  # 8-bit RGB
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
     png = b"\x89PNG\r\n\x1a\n"
     png += _png_chunk(b"IHDR", ihdr)
     png += _png_chunk(b"IDAT", compressed)
     png += _png_chunk(b"IEND", b"")
-
-    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "wb") as f:
         f.write(png)
     return path
@@ -1164,14 +1115,12 @@ def latents_to_png(
     scaling_factor: float = FLUX_VAE_SCALING_FACTOR,
     shift_factor: float = FLUX_VAE_SHIFT_FACTOR,
 ) -> str:
-    """Decode latents → RGB → write PNG. Returns path."""
     z = latents
     if z.ndim == 3:
         z = unpack_flux_latents(z, height_px, width_px)
 
     if vae_decode_fn is not None:
         with torch.no_grad():
-            # real VAE usually expects (z / scale) + shift already applied by caller or inside
             img = vae_decode_fn(z)
     else:
         img = approximate_vae_decode(
@@ -1233,23 +1182,7 @@ def run_inference(
     vae_decode_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> Dict[str, Any]:
     """
-    End-to-end: GGUF dequant → prompt encode → multi-step CFG sample → PNG.
-
-    Parameters
-    ----------
-    gguf_path           : Flux / DiT weights in GGUF (Q2/Q4/Q8/K/IQ/TQ ok)
-    prompt              : positive prompt
-    negative_prompt     : negative prompt (CFG)
-    cfg_scale           : guidance scale (Flux often 1–5; 1 disables CFG)
-    num_inference_steps : denoising steps
-    seed                : latents RNG seed
-    height, width       : **pixel** size of output PNG (latent is /8)
-    latent_channels     : 16 for Flux, 4 for SD-like
-    output_png          : path to write the PNG
-    scheduler           : 'flowmatch' (Flux) | 'ddpm'
-    model               : optional real transformer; else demo residual net
-    vae_decode_fn       : optional real VAE decode(latents[B,C,h,w]) -> [B,3,H,W]
-    text_encoder        : optional fn(str)->[1,D] embeds
+    GGUF dequant → prompt encode → multi-step CFG sample → PNG.
     """
     torch_dtype = resolve_dtype(dtype)
     torch_device = torch.device(device)
@@ -1259,10 +1192,11 @@ def run_inference(
 
     use_negative = model_accepts_negative(accepts_negative, cfg_scale)
 
-    # Flux latent spatial size
-    assert height % FLUX_VAE_SCALE_SPATIAL == 0 and width % FLUX_VAE_SCALE_SPATIAL == 0, (
-        f"height/width must be multiples of {FLUX_VAE_SCALE_SPATIAL}"
-    )
+    if height % FLUX_VAE_SCALE_SPATIAL != 0 or width % FLUX_VAE_SCALE_SPATIAL != 0:
+        raise ValueError(
+            f"height/width must be multiples of {FLUX_VAE_SCALE_SPATIAL}, "
+            f"got {height}x{width}"
+        )
     latent_h = height // FLUX_VAE_SCALE_SPATIAL
     latent_w = width // FLUX_VAE_SCALE_SPATIAL
 
@@ -1276,8 +1210,10 @@ def run_inference(
     print(f"  accepts_negative : {use_negative}")
     print(f"  seed             : {seed}")
     print(f"  image (px)       : {height}x{width}")
-    print(f"  latent           : B={batch_size} C={latent_channels} "
-          f"H={latent_h} W={latent_w}")
+    print(
+        f"  latent           : B={batch_size} C={latent_channels} "
+        f"H={latent_h} W={latent_w}"
+    )
     print(f"  dtype / device   : {torch_dtype} @ {torch_device}")
     print(f"  output_png       : {output_png}")
     print("-" * 68)
@@ -1292,7 +1228,7 @@ def run_inference(
         dequant_device=torch.device("cpu"),
     )
 
-    # 2) Text embeds
+    # 2) Text embeds (may be re-cast after denoiser dtype is resolved)
     if text_encoder is not None:
         with torch.no_grad():
             cond_embeds = text_encoder(prompt).to(device=torch_device, dtype=torch_dtype)
@@ -1307,6 +1243,8 @@ def run_inference(
             uncond_embeds = uncond_embeds.mean(dim=1)
     else:
         emb_seed = _stable_seed_from_text("gguf-char-embedding-v1")
+        # embedding table dtype follows requested dtype for storage;
+        # will cast to active_dtype later
         embed_table = build_text_embedding_table(
             128, context_dim, torch_device, torch_dtype, seed=emb_seed
         )
@@ -1319,7 +1257,7 @@ def run_inference(
                 uncond_embeds = uncond_embeds.expand(batch_size, -1).contiguous()
 
     print(
-        f"cond embeds: {tuple(cond_embeds.shape)}"
+        f"cond embeds: {tuple(cond_embeds.shape)} dtype={cond_embeds.dtype}"
         + (
             f" | uncond: {tuple(uncond_embeds.shape)}"
             if uncond_embeds is not None
@@ -1327,16 +1265,17 @@ def run_inference(
         )
     )
 
-    # 3) Denoiser
+    # 3) Denoiser + resolve active_dtype (demo may promote to fp32 on CPU)
     if model is not None:
         print("Using user-provided architecture")
         model = model.to(device=torch_device, dtype=torch_dtype)
         model = patch_model(model, state_dict, strict=False)
         denoise_fn = wrap_user_denoise_fn(model, call_style=denoise_call_style)
+        active_dtype = torch_dtype
     else:
         print("No architecture provided — demo residual denoiser (preview PNG)")
         ctx_dim = int(cond_embeds.shape[-1])
-        _, denoise_fn = build_demo_denoiser(
+        _net, denoise_fn, active_dtype = build_demo_denoiser(
             state_dict=state_dict,
             latent_channels=latent_channels,
             latent_h=latent_h,
@@ -1347,12 +1286,24 @@ def run_inference(
             dtype=torch_dtype,
         )
 
+    print(f"active compute dtype: {active_dtype}")
+
+    # Align embeds to denoiser dtype (critical for Float/Half fix)
+    cond_embeds = cond_embeds.to(device=torch_device, dtype=active_dtype)
+    if uncond_embeds is not None:
+        uncond_embeds = uncond_embeds.to(device=torch_device, dtype=active_dtype)
+
     # 4) Noise + sample
     latents = make_noise_latents(
-        batch_size, latent_channels, latent_h, latent_w,
-        torch_device, torch_dtype, seed,
+        batch_size,
+        latent_channels,
+        latent_h,
+        latent_w,
+        torch_device,
+        active_dtype,
+        seed,
     )
-    print(f"init noise std: {latents.float().std().item():.5f}")
+    print(f"init noise std: {latents.float().std().item():.5f} dtype={latents.dtype}")
 
     with torch.no_grad():
         if scheduler.lower() in ("flowmatch", "flow", "flux"):
@@ -1406,6 +1357,7 @@ def run_inference(
         "scheduler": scheduler,
         "accepts_negative": use_negative,
         "dtype": str(torch_dtype),
+        "active_dtype": str(active_dtype),
         "device": str(torch_device),
         "image_size": (height, width),
         "latent_shape": list(final_latents.shape),
@@ -1446,9 +1398,7 @@ def build_argparser() -> argparse.ArgumentParser:
         default="blurry, low quality, distorted, watermark, text",
     )
     p.add_argument("--cfg-scale", type=float, default=3.5)
-    p.add_argument(
-        "--steps", type=int, default=20, dest="num_inference_steps"
-    )
+    p.add_argument("--steps", type=int, default=20, dest="num_inference_steps")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--height", type=int, default=512, help="Output image height (px)")
     p.add_argument("--width", type=int, default=512, help="Output image width (px)")
@@ -1552,12 +1502,13 @@ def main(argv: Optional[List[str]] = None) -> None:
         print(f"Saved latents → {args.save_latents}")
 
     print("\nSummary")
-    print(f"  prompt    : {result['prompt']!r}")
-    print(f"  negative  : {result['negative_prompt']!r}")
-    print(f"  cfg/steps : {result['cfg_scale']} / {result['num_inference_steps']}")
-    print(f"  PNG       : {result['output_png']}")
-    print(f"  quants    : {result['meta'].get('qtype_counts')}")
-    print(f"  bitwidths : {result['meta'].get('bit_counts')}")
+    print(f"  prompt       : {result['prompt']!r}")
+    print(f"  negative     : {result['negative_prompt']!r}")
+    print(f"  cfg / steps  : {result['cfg_scale']} / {result['num_inference_steps']}")
+    print(f"  active_dtype : {result['active_dtype']}")
+    print(f"  PNG          : {result['output_png']}")
+    print(f"  quants       : {result['meta'].get('qtype_counts')}")
+    print(f"  bitwidths    : {result['meta'].get('bit_counts')}")
 
 if __name__ == "__main__":
     main()
