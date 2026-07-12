@@ -66,4 +66,6 @@ Currently there is no known bug, except that for smallest model on the list abov
 
 ## TODO List
 
-_TBD_
+- [ ] Add LoRA support. 
+- [ ] Add Stable Diffusion model support (1.5, XL, 3.5 are priority)
+- [ ] Optimize GPU usage. 
