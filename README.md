@@ -30,4 +30,36 @@ In this part, we consider you have created a new environment or use RunPod or si
 3. Clone and navigate to the repository's directory. 
     ```
     git clone https://github.com/Mann-E/gguf_inference
+    cd gguf_inference
     ```
+4. Download your desired model. For example, we've done tests on Klein 4B (Q4_K_M/Q4_0 quantizations)
+    ```
+    wget -c https://huggingface.co/unsloth/FLUX.2-klein-4B-GGUF/resolve/main/flux-2-klein-4b-Q4_0.gguf?download=true -O "flux-2-klein-4b-Q4_0.gguf"
+    ``` 
+5. You can use `--meta-only` flag to get the quantization information. 
+    ```
+    python gguf_inference.py flux-2-klein-4b-Q4_0.gguf --meta-only
+    ``` 
+6. You can run the project and get your desired image outputs:
+    ```
+    python gguf_inference.py flux-2-klein-4b-Q4_0.gguf \
+    --model-type flux2_klein_4b \
+    --vae-source pretrained \
+    --te-mode bnb4 \
+    --prompt "arabesque paper marbling painting of a mosque, architectural picture" \
+    --cfg-scale 1.0 --steps 12 \
+    --height 576 --width 1024 \
+    --dtype bfloat16 --device cuda \
+    --output mosque.png
+    ``` 
+## Supported Models
+
+_TBD_
+
+## Known Issues 
+
+_TBD_
+
+## TODO List
+
+_TBD_
