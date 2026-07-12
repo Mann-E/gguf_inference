@@ -19,3 +19,15 @@ The project has been understood (from Comfy's GGUF node) and planned by _Calude 
 The fastest and easiest way is to use this [Jupyter Notebook](GGUF_Inference_for_FLUX_Stable_Diffusion.ipynb) to understand how it works, however if you want to run it locally or outside of Jupyter, this is the way. 
 
 ### Installing dependencies
+
+In this part, we consider you have created a new environment or use RunPod or similar services.
+
+1. Install `pytorch`. If you use Google Colab or RunPod, you usually have a profile which has pytorch installed. 
+2. Install other libraries: 
+    ```
+    pip install gguf transformers accelerate safetensors sentencepiece protobuf pillow huggingface_hub bitsandbytes -q
+    ```
+3. Clone and navigate to the repository's directory. 
+    ```
+    git clone https://github.com/Mann-E/gguf_inference
+    ```
