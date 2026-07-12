@@ -62,7 +62,7 @@ Currently the tool supports:
 
 ## Known Issues 
 
-_TBD_
+Currently there is no known bug, except that for smallest model on the list above you need at least 8GB of VRAM. 
 
 ## TODO List
 
