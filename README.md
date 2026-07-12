@@ -16,4 +16,6 @@ The project has been understood (from Comfy's GGUF node) and planned by _Calude 
 
 ## How to use?
 
-_TBD_
+The fastest and easiest way is to use this [Jupyter Notebook](GGUF_Inference_for_FLUX_Stable_Diffusion.ipynb) to understand how it works, however if you want to run it locally or outside of Jupyter, this is the way. 
+
+### Installing dependencies
