@@ -54,7 +54,11 @@ In this part, we consider you have created a new environment or use RunPod or si
     ``` 
 ## Supported Models
 
-_TBD_
+Currently the tool supports:
+
+- Flux 2 Klein 4B (and fine tunes)
+- Flux 2 Klein 9B (and fine tunes)
+- Flux 2 Dev (and fine tunes)
 
 ## Known Issues 
 
